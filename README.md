@@ -25,6 +25,37 @@ java HardwareTester.java --http 8090 --tcp 9000
 
 > A porta HTTP padrão é 8090 porque a 8080 costuma estar ocupada nesta máquina.
 
+## Ignorando URIs (tirando ruído do log)
+
+Dispositivos costumam mandar heartbeat/keep-alive o tempo todo, o que enterra o
+que interessa. Use `--ignore` para não logar essas rotas:
+
+```sh
+# vários padrões separados por vírgula
+java HardwareTester.java --ignore /heartbeat,/favicon.ico
+
+# a flag também pode ser repetida
+java HardwareTester.java --ignore /heartbeat --ignore "/status/*/ping"
+```
+
+Regras dos padrões (comparados contra a URI completa, **path + query**, sem
+diferenciar maiúsculas de minúsculas):
+
+- **sem `*`** → casa por *contém*. `/heartbeat` pega `/heartbeat`,
+  `/api/heartbeat` e `/heartbeat?id=3`.
+- **com `*`** → vira glob e precisa casar a URI inteira. `/status/*/ping` pega
+  `/status/abc/ping`, mas não `/x/status/abc/ping`; para pegar por sufixo use
+  `*/ping`.
+
+Comportamento das requisições ignoradas:
+
+- o corpo ainda é lido e o dispositivo continua recebendo `200 OK` — só o log é
+  suprimido;
+- na **primeira** vez que um padrão casa, sai uma linha
+  `[filtro] ignorando '/heartbeat' -> POST /heartbeat` só para confirmar que o
+  filtro pegou; depois disso, silêncio;
+- o filtro vale só para o HTTP (o TCP bruto não tem URI).
+
 ## Como testar
 
 HTTP com JSON:

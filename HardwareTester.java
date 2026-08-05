@@ -11,10 +11,12 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 
 /**
  * Ferramenta de teste de conexão com hardwares.
@@ -29,6 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Uso (Java 21 - single file, sem compilar):
  *   java HardwareTester.java
  *   java HardwareTester.java --http 8080 --tcp 9000
+ *   java HardwareTester.java --ignore /heartbeat,/favicon.ico
  *
  * Padrões: HTTP em 8080, TCP em 9000.
  */
@@ -40,6 +43,35 @@ public class HardwareTester {
     // Contadores para dar um id a cada requisição/conexão nos logs.
     private static final AtomicLong HTTP_SEQ = new AtomicLong();
     private static final AtomicLong TCP_SEQ = new AtomicLong();
+
+    /** URIs que não devem ser logadas (ver --ignore). */
+    private static final List<IgnoreRule> IGNORED = new ArrayList<>();
+
+    /**
+     * Regra de filtro de URI. Sem '*' o padrão casa por "contém";
+     * com '*' vira glob (o '*' casa qualquer sequência).
+     */
+    private record IgnoreRule(String raw, Pattern glob, AtomicLong hits) {
+
+        static IgnoreRule of(String raw) {
+            Pattern p = null;
+            if (raw.indexOf('*') >= 0) {
+                StringBuilder rx = new StringBuilder();
+                for (String part : raw.split("\\*", -1)) {
+                    if (!rx.isEmpty()) rx.append(".*");
+                    if (!part.isEmpty()) rx.append(Pattern.quote(part));
+                }
+                p = Pattern.compile(rx.toString(), Pattern.CASE_INSENSITIVE);
+            }
+            return new IgnoreRule(raw, p, new AtomicLong());
+        }
+
+        boolean matches(String uri) {
+            return glob != null
+                    ? glob.matcher(uri).matches()
+                    : uri.toLowerCase().contains(raw.toLowerCase());
+        }
+    }
 
     public static void main(String[] args) throws Exception {
         // Força UTF-8 na saída para acentos não saírem truncados,
@@ -53,8 +85,9 @@ public class HardwareTester {
 
         for (int i = 0; i < args.length - 1; i++) {
             switch (args[i]) {
-                case "--http" -> httpPort = Integer.parseInt(args[i + 1]);
-                case "--tcp"  -> tcpPort  = Integer.parseInt(args[i + 1]);
+                case "--http"   -> httpPort = Integer.parseInt(args[i + 1]);
+                case "--tcp"    -> tcpPort  = Integer.parseInt(args[i + 1]);
+                case "--ignore" -> addIgnored(args[i + 1]);
                 default -> { /* ignora */ }
             }
         }
@@ -79,13 +112,28 @@ public class HardwareTester {
         long id = HTTP_SEQ.incrementAndGet();
         StringBuilder sb = new StringBuilder();
         try {
+            String uri = ex.getRequestURI().toString();
+            // Mesmo ignorando, o corpo precisa ser drenado antes de responder.
             byte[] body = readAll(ex.getRequestBody());
+
+            IgnoreRule rule = ignoreRuleFor(uri);
+            if (rule != null) {
+                long hits = rule.hits().incrementAndGet();
+                if (hits == 1) {
+                    // Avisa só na primeira vez, para confirmar que o filtro pegou
+                    // sem poluir o log a cada requisição.
+                    print("[filtro] ignorando '" + rule.raw() + "' -> "
+                            + ex.getRequestMethod() + " " + uri + "\n");
+                }
+                respondOk(ex, id);
+                return;
+            }
 
             sb.append(divider("HTTP #" + id));
             sb.append(line("Quando",   now()));
             sb.append(line("Origem",   ex.getRemoteAddress().toString()));
             sb.append(line("Método",   ex.getRequestMethod()));
-            sb.append(line("URI",      ex.getRequestURI().toString()));
+            sb.append(line("URI",      uri));
             sb.append(line("Protocolo",ex.getProtocol()));
 
             sb.append("\n  Headers:\n");
@@ -100,19 +148,41 @@ public class HardwareTester {
 
             print(sb.toString());
 
-            // Resposta simples de confirmação.
-            byte[] resp = ("OK - recebido pelo hardware-connection-tester (HTTP #" + id + ")\n")
-                    .getBytes(StandardCharsets.UTF_8);
-            ex.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-            ex.sendResponseHeaders(200, resp.length);
-            try (OutputStream os = ex.getResponseBody()) {
-                os.write(resp);
-            }
+            respondOk(ex, id);
         } catch (Exception e) {
             print("[HTTP #" + id + "] erro ao processar requisição: " + e);
         } finally {
             ex.close();
         }
+    }
+
+    /** Resposta simples de confirmação (também usada nas URIs ignoradas). */
+    private static void respondOk(HttpExchange ex, long id) throws IOException {
+        byte[] resp = ("OK - recebido pelo hardware-connection-tester (HTTP #" + id + ")\n")
+                .getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+        ex.sendResponseHeaders(200, resp.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(resp);
+        }
+    }
+
+    // -------------------------------------------------------- Filtro de URIs
+
+    /** Registra padrões de URI a ignorar; aceita vários separados por vírgula. */
+    private static void addIgnored(String csv) {
+        for (String raw : csv.split(",")) {
+            String p = raw.trim();
+            if (!p.isEmpty()) IGNORED.add(IgnoreRule.of(p));
+        }
+    }
+
+    /** Devolve a primeira regra que casa com a URI, ou null se nenhuma casar. */
+    private static IgnoreRule ignoreRuleFor(String uri) {
+        for (IgnoreRule r : IGNORED) {
+            if (r.matches(uri)) return r;
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------- TCP
@@ -248,6 +318,13 @@ public class HardwareTester {
                 """);
         print("  HTTP catch-all : http://" + host + ":" + httpPort + "/  (qualquer método/rota/content-type)\n");
         print("  TCP bruto      : " + host + ":" + tcpPort + "  (socket puro, qualquer byte)\n");
+        if (IGNORED.isEmpty()) {
+            print("  URIs ignoradas : nenhuma  (use --ignore /rota,/outra*)\n");
+        } else {
+            List<String> raws = new ArrayList<>();
+            for (IgnoreRule r : IGNORED) raws.add(r.raw());
+            print("  URIs ignoradas : " + String.join(", ", raws) + "\n");
+        }
         print("  Aguardando conexões... (Ctrl+C para parar)\n");
     }
 }
